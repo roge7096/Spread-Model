@@ -1,0 +1,329 @@
+---
+title: "NFl Spread Model"
+author: "Grant Rogers"
+date: "10/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(randomForest)
+library(rpart)
+library(caret)
+library(pracma)
+library(Mcomp)
+library(smooth)
+library(car)
+library(dplyr)
+library(aod)
+library(ggplot2)
+library(rlang)
+library(tidyverse)
+library(ggrepel)
+library(ggimage)
+library(nflfastR)
+library(nflreadr)
+library(expss)
+library(zoo)
+library(readxl)
+library(rvest)
+library(openxlsx)
+library(gridExtra) # for presenting plots in a grid format
+library(glmnet) # for ridge and lasso regressions
+library(rpart.plot)
+```
+
+```{r}
+# Set up the parameters
+week_filter = 17 # This parameter dictates which week of games are being considered for betting
+hfa <- 2.0
+seasons <- 2005:2021 # This parameter dictates which seasons are pulled into pbp from nflfastR
+formula <- as.formula("result ~ home_off_epa + away_off_epa + home_def_epa + away_def_epa")
+formula_logit <- as.formula("home_cover ~ spread_difference + home_off_epa + away_off_epa + home_def_epa + away_def_epa")
+rolling_n <- 14 # 14 was determined to be optimal based on cross validation of n between 10 and 20
+
+```
+
+
+Input Data
+```{r}
+# Play by play data
+pbp <- load_pbp(seasons)
+```
+
+```{r}
+# Read 2021 Schedule
+NFL_2021_schedule <- read_excel("~/Data Analysis/NFL/Analysis - R/Data Inputs/NFL_2021_schedule.xlsx", 
+    col_types = c("numeric", "text", "date", 
+        "text", "text", "text", "text", "text", 
+        "text"))
+
+# Read Quarterback Points
+quarterback_changes <- read_excel("~/Data Analysis/NFL/Analysis - R/Data Inputs/NFL QB Points.xlsx")
+
+# Bring in lines from mybookie.ag
+Data_lines <- read_html("https://mybookie.ag/sportsbook/nfl/#accordionBets1") %>%
+  html_nodes('#accordionBets1 .col-7') %>% 
+  #.[1:90] %>% 
+  html_text()
+Data_lines_1 <- str_trim(str_replace_all(Data_lines,"&frac12",".5"), side = "both")
+Data_lines_2 <- gsub("\\s+", " ", str_trim(Data_lines_1))
+Data_lines_3 <- as.data.frame(str_split_fixed(Data_lines_2, " ", n = 12), stringsAsFactors = FALSE) %>% 
+  dplyr::select(V1,V7) %>% 
+  pivot_longer(c(V1, V7))
+
+
+Data_text <- read_html("https://mybookie.ag/sportsbook/nfl/#accordionBets1") %>%
+  html_nodes('#accordionBets1 .text-center') %>% 
+  #.[2:46] %>% 
+  html_text() %>% 
+  rep(times = 2)
+Data_text
+
+Data_teams_1 <- read_html("https://mybookie.ag/sportsbook/nfl/#accordionBets1") %>%
+  html_nodes('#accordionBets1 a') %>% 
+  #.[2:46] %>% 
+  html_text() %>% 
+  rep(each = 1)
+
+Data_teams <- data.frame(team=Data_teams_1) %>% 
+  filter(!grepl("\n", team)) %>% 
+  filter(!grepl("Props", team))
+Data_teams
+
+betting_spreads <- data.frame(team=Data_teams,
+                              # market=Data_text,
+                              line=Data_lines_3$value)
+  # filter(market == "Spread"))
+betting_spreads$market_spread <- as.numeric(as.character(betting_spreads$line))
+
+betting_spreads <- betting_spreads %>% 
+  replace(is.na(.), 0)
+
+head(betting_spreads)
+```
+
+
+Create a list of games, summarize EPA data by game and by team for both offense and defense, then join the EPA data to the list of games (there will be four splits: home-offense, visitor-offense, home-defense, visitor-defense). This will be used to feed the linear regression.
+```{r}
+# Create a list of games
+games <- pbp %>% 
+  dplyr::select(game_id, home_team, away_team, home_score, away_score, result, spread_line, roof) %>% 
+  group_by(game_id, home_team, away_team, away_score, home_score, result, spread_line, roof) %>% 
+  summarise(games = n_distinct(game_id)) %>% 
+  mutate(home_margin_to_spread = result - spread_line)
+
+
+# Summarize offensive EPA by team
+Off_EPA <- pbp %>%
+  filter((play_type == 'pass' | play_type == 'run') & !is.na(epa)) %>%
+  group_by(posteam, game_id) %>%
+  summarize(Off_EPA = round(sum(epa),2),
+            plays = n_distinct(play_id)) %>%
+  mutate(roll_EPA_per_play = round(rollapplyr(Off_EPA,rolling_n,sum,partial=TRUE) / rollapplyr(plays,rolling_n,sum,partial=TRUE),2)) %>%
+  mutate(row_num = row_number()) %>% 
+  mutate(epa_prediction = lag(roll_EPA_per_play, 1))
+
+# Summarize defensive EPA by team
+Def_EPA <- pbp %>%
+  filter((play_type == 'pass' | play_type == 'run') & !is.na(epa)) %>%
+  group_by(defteam, game_id) %>%
+  summarize(Def_EPA = round(sum(epa),2),
+            plays = n_distinct(play_id)) %>%
+  mutate(roll_EPA_per_play = round(rollapplyr(Def_EPA,rolling_n,sum,partial=TRUE) / rollapplyr(plays,rolling_n,sum,partial=TRUE),2)) %>%
+  mutate(row_num = row_number()) %>% 
+  mutate(epa_prediction_def = lag(roll_EPA_per_play, 1))
+
+# Join offensive EPA to list of games
+EPA_regression_data_off <- left_join(left_join(games, Off_EPA, c('game_id' = 'game_id', 'home_team' = 'posteam')), Off_EPA, c('game_id' = 'game_id', 'away_team' = 'posteam')) %>% 
+  filter(!is.na(epa_prediction.x) & !is.na(epa_prediction.y)) %>% 
+  dplyr::select(game_id, home_team, away_team, away_score, home_score, result, spread_line, roof, epa_prediction.x, epa_prediction.y, home_margin_to_spread) %>% 
+  rename(home_off_epa = epa_prediction.x) %>% 
+  rename(away_off_epa = epa_prediction.y) %>% 
+  mutate(roof = ifelse(roof == 'closed', 'dome', ifelse(roof == 'open','outdoors',roof))) %>% 
+  mutate(environment = ifelse(roof == 'outdoors',0,1))
+
+# Join defensive EPA to list of games
+EPA_regression_data_def <- left_join(left_join(games, Def_EPA, c('game_id' = 'game_id', 'home_team' = 'defteam')), Def_EPA, c('game_id' = 'game_id', 'away_team' = 'defteam')) %>% 
+  filter(!is.na(epa_prediction_def.x) & !is.na(epa_prediction_def.y)) %>% 
+  dplyr::select(game_id, home_team, away_team, away_score, home_score, result, spread_line, roof, epa_prediction_def.x, epa_prediction_def.y, home_margin_to_spread) %>% 
+  rename(home_def_epa = epa_prediction_def.x) %>% 
+  rename(away_def_epa = epa_prediction_def.y) %>% 
+  mutate(roof = ifelse(roof == 'closed', 'dome', ifelse(roof == 'open','outdoors',roof))) %>% 
+  mutate(environment = ifelse(roof == 'outdoors',0,1))
+
+# Join offensive EPA to defensive EPA
+EPA_regression_data <- left_join(EPA_regression_data_off, EPA_regression_data_def, c('game_id' = 'game_id')) %>% 
+  dplyr::select(game_id, home_team.x, away_team.x, away_score.x, home_score.x, result.x, spread_line.x, home_off_epa, away_off_epa, home_def_epa, away_def_epa, home_margin_to_spread.x) %>% 
+  rename_with(~ tolower(gsub(".x", "", .x, fixed = TRUE))) %>% 
+  mutate(home_cover = if_else(home_margin_to_spread > 0, 1, 0))
+```
+
+Create plots to analyze the data prior to running the regression
+```{r}
+# Create scatter plots to evaluate correlation
+panel.cor <- function(x, y){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0,1,0,1))
+  r <- round(cor(x,y),2)
+  txt <- paste0("R = ", r)
+  text(0.5, 0.5, txt)
+}
+
+upper.panel <- function(x,y){
+  points(x,y, pch = 19)
+}
+
+pairs(EPA_regression_data[,6:12],
+      lower.panel = panel.cor,
+      upper.panel = upper.panel)
+
+# Distribution of the margin relative to the closing spread
+p.margin_to_spread_dist <- ggplot(data = EPA_regression_data, mapping = aes(x = home_margin_to_spread)) +
+  geom_histogram() +
+  labs(title = "Scoring Margin Relative to Spread",
+       subtitle = "Positive indicates home team covered the spread")
+p.margin_to_spread_dist
+
+# Plots of EPA/Play cuts vs. Result
+p.home_off <- ggplot(data = subset(EPA_regression_data, abs(home_off_epa) <= .2 & abs(result) <= 30), mapping = aes(x = home_off_epa, y = result)) +
+  geom_point(alpha = .2, color = "gray") +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal()
+p.home_def <- ggplot(data = subset(EPA_regression_data, abs(home_def_epa) <= .2 & abs(result) <= 30), mapping = aes(x = home_def_epa, y = result)) +
+  geom_point(alpha = .2, color = "gray") +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal() +
+  scale_x_reverse()
+p.away_off <- ggplot(data = subset(EPA_regression_data, abs(away_off_epa) <= .2 & abs(result) <= 30), mapping = aes(x = away_off_epa, y = result)) +
+  geom_point(alpha = .2, color = "gray") +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal()
+p.away_def <- ggplot(data = subset(EPA_regression_data, abs(away_def_epa) <= .2 & abs(result) <= 30), mapping = aes(x = away_def_epa, y = result)) +
+  geom_point(alpha = .2, color = "gray") +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal() +
+  scale_x_reverse()
+grid.arrange(p.home_off, p.home_def, p.away_off, p.away_def, ncol = 2)
+
+
+```
+
+Run the linear regression and the regression tree
+```{r}
+# Linear Regression
+lm <- lm(formula, data = EPA_regression_data)
+summary(lm)
+
+residualPlot(lm)
+plot(lm)
+
+# Regression Tree
+model_class <- rpart(formula,
+                     method = "anova", 
+                     data = EPA_regression_data)
+
+printcp(model_class) # display the results
+plotcp(model_class) # visualize cross-validation results
+summary(model_class) # detailed summary of splits
+par(mfrow=c(1,1)) # two plots on one page
+rsq.rpart(model_class) # visualize cross-validation results  
+
+plot(model_class, uniform=TRUE,
+     main="Regression Tree for Margin of Victory")
+text(model_class, use.n=TRUE, all=TRUE, cex=.7)
+rpart.plot(model_class)
+```
+
+
+Obtain a list of teams with their most recent roll_EPA_per_play, this will be used to predict spreads.
+```{r}
+# Retrieve the most recent games for all teams in the Off_EPA and Def_EPA datasets
+Off_EPA_model = Off_EPA %>% 
+  group_by(posteam) %>% 
+  filter(row_num == max(row_num)) %>% 
+  dplyr::select(posteam, row_num, roll_EPA_per_play)
+
+Def_EPA_model = Def_EPA %>% 
+  group_by(defteam) %>% 
+  filter(row_num == max(row_num)) %>% 
+  dplyr::select(defteam, row_num, roll_EPA_per_play)
+```
+
+Join the offensive and defensive model to the season schedule, modifying the data as necessary, and adding in predictions.
+```{r}
+# Join offensive model to the schedule as home offense
+NFL_2021_schedule_step1 <- left_join(NFL_2021_schedule, Off_EPA_model, c('Home' = 'posteam')) %>% 
+  rename(home_off_epa = roll_EPA_per_play)
+
+# Join the quarterback_changes to the data. This allows for adjusting for changes in the home quarterbacking situation
+NFL_2021_schedule_step2 <- left_join(NFL_2021_schedule_step1, quarterback_changes, c('Home' = 'team')) %>% 
+  dplyr::select(-quarterback_current, -quarterback_prior, -spar_prior) %>% 
+  rename(qb_spar_home = spar_current) %>% 
+  mutate(spar_home_adjustment = spar_change * adjust_flag) %>% 
+  dplyr::select(-pff_team, -spar_change, -adjust_flag)
+  
+# Join the offensive model to the data as visitor offense
+NFL_2021_schedule_step3 <- left_join(NFL_2021_schedule_step2, Off_EPA_model, c('Visitor' = 'posteam')) %>% 
+  rename(away_off_epa = roll_EPA_per_play)
+
+# Join the quarterback_changes to the data. This allows for adjusting for changes in the visitor quarterbacking situation
+NFL_2021_schedule_step4 <- left_join(NFL_2021_schedule_step3, quarterback_changes, c('Visitor' = 'team')) %>% 
+  dplyr::select(-quarterback_current, -quarterback_prior, -spar_prior) %>% 
+  rename(qb_spar_visitor = spar_current) %>% 
+  mutate(spar_visitor_adjustment = spar_change * adjust_flag) %>% 
+  dplyr::select(-pff_team, -spar_change, -adjust_flag)
+
+# Join the defensive model to the data as home defense
+NFL_2021_schedule_step5 <- left_join(NFL_2021_schedule_step4, Def_EPA_model, c('Home' = 'defteam')) %>% 
+  rename(home_def_epa = roll_EPA_per_play)
+
+# Join the defensive model to the data as visitor defense
+NFL_2021_schedule_step6 <- left_join(NFL_2021_schedule_step5, Def_EPA_model, c('Visitor' = 'defteam')) %>% 
+  rename(away_def_epa = roll_EPA_per_play) %>% 
+  mutate(spar_net = round(spar_home_adjustment - spar_visitor_adjustment, digits = 1))
+
+# Set up the dataframe to be formatted in a useful manner; filter on the week of interest
+NFL_2021_schedule_step7 <- NFL_2021_schedule_step6 %>% 
+  dplyr::select(Season, Week, Date, Home, HomeTm, Visitor, VisTm, home_off_epa, away_off_epa, home_def_epa, away_def_epa, spar_net, qb_spar_home, qb_spar_visitor) %>% 
+  filter(Week == week_filter)
+
+# Add in predictions from linear regression and regression tree models
+NFL_2021_schedule_step7$spread_pred_regression <- -round(predict(lm,NFL_2021_schedule_step7) + NFL_2021_schedule_step7$spar_net, digits = 1)
+NFL_2021_schedule_step7$spread_pred_tree <- -round(predict(model_class, NFL_2021_schedule_step7) + NFL_2021_schedule_step7$spar_net, digits = 1)
+NFL_2021_schedule_step7$spread_qb_spar <- -NFL_2021_schedule_step7$qb_spar_home + NFL_2021_schedule_step7$qb_spar_visitor - hfa
+```
+
+Join the market data to the model data and create fields for betting suggestions
+```{r}
+# Join Market Data to Model Data
+NFL_Model <- left_join(NFL_2021_schedule_step7, betting_spreads, c("HomeTm" = "team")) %>% 
+  mutate(weighted_spread = round(.5*(market_spread + ((.8 * spread_pred_regression) + (.1 * (spread_pred_tree + spread_qb_spar)))), digits = 1)) %>% 
+  mutate(spread_gap = round(abs(weighted_spread) - abs(market_spread), digits = 1)) %>% 
+  mutate(spread_ratio = round(abs(weighted_spread) / abs(market_spread), digits = 1)) %>% 
+  mutate(bet_suggestion = if_else(market_spread < 0, 
+                                  # Home team is favorite
+                                  if_else(abs(weighted_spread) >= abs(market_spread),paste(HomeTm, market_spread, sep = " "),
+                                      if_else(abs(weighted_spread) - abs(market_spread) <= -1.5,paste(VisTm, -market_spread, sep = " "),"pass")),
+                                  # Home team is underdog
+                                  if_else(abs(weighted_spread) >= abs(market_spread),paste(VisTm, -market_spread, sep = " "),
+                                          if_else(abs(weighted_spread) - abs(market_spread) <= -1.5,paste(HomeTm, market_spread, sep = " "),"pass"))
+           )) %>% 
+  mutate(bet_suggestion2 = if_else(market_spread < 0, 
+                                  # Home team is favorite
+                                  if_else(abs(weighted_spread) / abs(market_spread) > 1,paste(HomeTm, market_spread, sep = " "),
+                                          if_else(abs(weighted_spread) / abs(market_spread) <= .6,paste(VisTm, -market_spread, sep = " "),"pass")),
+                                  # Home team is underdog
+                                  if_else(abs(weighted_spread) / abs(market_spread) > 1,paste(VisTm, -market_spread, sep = " "),
+                                          if_else(abs(weighted_spread) / abs(market_spread) <= .6,paste(HomeTm, market_spread, sep = " "),"pass"))
+  )) %>% 
+  mutate(gap = "") %>% 
+  dplyr::select(Season, Week, Date, Visitor,Home,market_spread,weighted_spread,spread_gap,spread_ratio,spread_pred_regression,spread_qb_spar,bet_suggestion,bet_suggestion2) %>% 
+  arrange(spread_gap)
+```
+
+Write output
+```{r}
+write.xlsx(NFL_Model, '~/Data Analysis/NFL/Analysis - R/nfl_model.xlsx')
+#write.csv(pbp, 'pbp_data_all.csv')
+```

@@ -1,0 +1,90 @@
+---
+title: "NFL Regression Model Exploration"
+author: "Grant Rogers"
+date: "10/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Probability of Home Cover
+
+logit_regression <- EPA_regression_data %>% 
+  filter(home_margin_to_spread != 0)
+logit_regression$spread_prediction <- predict(lm, logit_regression)
+logit_regression <- logit_regression %>% 
+  mutate(spread_difference = spread_prediction - spread_line) %>%  # Positive: model likes home team
+  mutate(spread_difference_bins = round(spread_prediction, digits = 0))
+
+home_covers_spread_difference <- logit_regression %>% 
+  group_by(spread_difference_bins) %>% 
+  summarise(home_cover_percentage = mean(home_cover),
+            games = n()) %>% 
+  filter(games >= 100)
+
+# Expectation: with the spread difference, a positive value indicates the model likes the home team relative to the spread - therefore the home team should cover more often. Vice versa: when the spread difference is negative, then the away team is favored by the model and should cover more often.
+ggplot(data = home_covers_spread_difference, mapping = aes(x = spread_difference_bins, y = home_cover_percentage)) +
+  geom_col()
+
+
+
+ggplot(data = logit_regression, mapping = aes(x = spread_prediction, y = spread_line)) +
+  geom_point(alpha = .3) +
+  geom_smooth(method = "lm")
+
+lm_logit <- glm(formula_logit, data = logit_regression, family = binomial(link = "logit"))
+summary(lm_logit)
+
+# Crunch Residuals: Deviance
+library(data.table)
+crunch_residual2 <- function(dataset, model, target, size = 50) {
+  r <- model$residuals
+  x1 <- model$fitted.values
+  y <- as.data.frame(cbind(r, x1))
+  
+  y <- y[order(x1), ]
+  test <- setDT(y)[, as.list(colMeans(.SD)), by = gl(ceiling(nrow(y) / size), size, nrow(y))]
+  
+  qplot(y = test$r, x = test$x1, ylab = "Residual", xlab = "Fitted Value", main = "Crunch Residual") +
+    geom_smooth(method = "lm")
+}
+
+crunch_residual2(
+  dataset = logit_regression,
+  model = lm_logit,
+  target = "home_cover",
+  size = 50
+)
+
+# Ridge & Lasso Regressions
+X <- model.matrix(formula_logit, data = logit_regression)
+model.lm.ridge <- glmnet(X, y = logit_regression$home_cover, family = "binomial", alpha = 0, lambda = 0.1)
+model.lm.lasso <- glmnet(X, y = logit_regression$home_cover, family = "binomial", alpha = 1, lambda = 0.1)
+model.lm.en025 <- glmnet(X, y = logit_regression$home_cover, family = "binomial", alpha = 0.25, lambda = 0.1)
+model.lm.en075 <- glmnet(X, y = logit_regression$home_cover, family = "binomial", alpha = 0.75, lambda = 0.1)
+
+# Predict results (so we can plot the line)
+logit_regression$pred_ridge01 <- predict(model.lm.ridge, newx = X)
+logit_regression$pred_lasso01 <- predict(model.lm.lasso, newx = X)
+logit_regression$pred_en01025 <- predict(model.lm.en025, newx = X)
+logit_regression$pred_en01075 <- predict(model.lm.en075, newx = X)
+
+model.lm.ridge$beta
+model.lm.lasso$beta
+model.lm.en025$beta
+model.lm.en075$beta
+```
+
+```{r}
+# Spread plot
+spread_result_distribution <- logit_regression %>%
+  filter(spread_line >= 2.5 & spread_line <= 3.5) %>% 
+  mutate(three = if_else(result == 3, 1, 0))
+
+ggplot(data = spread_result_distribution, mapping = aes(x = result)) +
+  geom_bar(aes(y = (..count..)/sum(..count..), fill = factor(three))) +
+  geom_density()
+```

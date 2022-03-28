@@ -1,0 +1,91 @@
+---
+title: 'Example: Random Forest'
+author: "Grant Rogers"
+date: "12/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(ISLR)
+library(pROC)
+```
+
+```{r}
+# Run this chunk if using R 3.6.0 or later.
+RNGkind(sample.kind = "Rounding")
+```
+
+If you are using R 4.0.0 or later, the following command will ensure that read.csv() interprets variables whose values are characters as factor variables. This was the default behavior in prior versions of R. All code is written assuming such variables are factor variables.
+
+```{r}
+# Run this chunk if using R 4.0.0 or later. You may get what looks like an error message. It can be ignored.
+options(stringsAsFactors = TRUE)
+```
+
+
+```{r}
+# Prepare data for the model
+
+data.full <- EPA_regression_data[,9:41] %>% 
+  mutate(home_cover = as.factor(home_cover)) %>% 
+  drop_na()
+  
+
+index <- createDataPartition(data.full$home_cover, p = .8, list = F)
+data.train <- data.full %>% slice(index)
+data.test <- data.full %>% slice(-index)
+```
+
+
+```{r}
+# Train the Random Forest model
+
+rfGrid <- expand.grid(mtry = c(2, 4, 6, 8, 10, 12)) # The number of features to select at each split.
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3, # We want to do 5-fold cross validation (repeated 3 times for robustness)
+)
+
+model.rf <- train(home_cover ~ .,
+  data = data.train,
+  method = "rf", # This is so we use the randomForest algorithm.
+  trControl = ctrl,
+  tuneGrid = rfGrid,
+  # We can specify the other parameters for the randomForest model here if we wish to. If we don't they will take on their default values.
+  ntree = 500, # The default is 500, setting to 50 will save us a lot of computation time but may not produce the best results.
+  importance = TRUE,
+  na.action = na.exclude
+)
+```
+
+
+```{r}
+# Evaluate the model
+
+# Variable Importance
+imp <- varImp(model.rf)
+plot(imp) # top = 20 makes the results more readable.
+
+# Evaluate the model
+pred.rf <- predict(model.rf, data.test, type = "prob")
+qplot(pred.rf$`1`)
+
+data.test <- data.test %>% 
+  mutate(pred_zero_one = as.factor(1*(pred.rf$`1`>.5))) %>% 
+  mutate(pred_home_cover = pred.rf$'1') %>% 
+  mutate(pred_away_cover = pred.rf$'0')
+summary(data.test$pred_zero_one)
+
+confusionMatrix(data.test$pred_zero_one, data.test$home_cover, positive = "1")
+
+par(pty="s") # Force plot to be square
+roc(data.test$home_cover, pred.rf$`1`, plot = T, print.auc = TRUE)
+
+```
+

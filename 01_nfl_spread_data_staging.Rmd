@@ -1,0 +1,221 @@
+
+
+```{r}
+# Set up the parameters
+week_filter = 17 # This parameter dictates which week of games are being considered for betting
+hfa <- 2.0
+seasons <- 2005:2021 # This parameter dictates which seasons are pulled into pbp from nflfastR
+formula <- as.formula("result ~ home_off_epa + away_off_epa + home_def_epa + away_def_epa")
+formula_logit <- as.formula("home_cover ~ spread_difference + home_off_epa + away_off_epa + home_def_epa + away_def_epa")
+rolling_n <- 14 # 14 was determined to be optimal based on cross validation of n between 10 and 20
+rolling_n_short <- 4
+options(scipen = 9999)
+```
+
+
+```{r}
+# Create a list of games
+games <- pbp %>% 
+  dplyr::select(game_id, home_team, away_team, home_score, away_score, result, spread_line, roof) %>% 
+  group_by(game_id, home_team, away_team, away_score, home_score, result, spread_line, roof) %>% 
+  summarise(games = n_distinct(game_id)) %>% 
+  mutate(home_margin_to_spread = result - spread_line) %>% 
+  mutate(environment = ifelse(roof == 'open',0,1))
+```
+
+
+```{r}
+# Summarize offensive EPA by team
+Off_EPA <-  pbp %>%
+  filter((play_type == 'pass' | play_type == 'run') & !is.na(epa)) %>%
+  group_by(posteam, game_id) %>%
+  summarize(Off_EPA = round(sum(epa),2),
+            Off_WPA = round(sum(wpa),2),
+            sum_third_down_converted = sum(third_down_converted, na.rm= TRUE),
+            sum_third_down_failed = sum(third_down_failed, na.rm= TRUE),
+            sum_passing_yards = sum(passing_yards, na.rm= TRUE),
+            sum_penalty_yards = sum(penalty_yards, na.rm= TRUE),
+            sum_pass_oe = sum(pass_oe, na.rm= TRUE),
+            sum_cpoe = sum(cpoe, na.rm= TRUE),
+            pass_plays = sum(pass, na.rm = TRUE),
+            plays = n_distinct(play_id)) %>%
+  mutate(row_num = row_number()) %>% 
+  mutate(epa_prediction = lag(round(rollapplyr(Off_EPA,rolling_n,sum,partial=TRUE) / rollapplyr(plays,rolling_n,sum,partial=TRUE),2), 1)) %>% 
+  mutate(epa_prediction_short = lag(round(rollapplyr(Off_EPA,rolling_n_short,sum,partial=TRUE) / rollapplyr(plays,rolling_n_short,sum,partial=TRUE),2), 1)) %>% 
+  mutate(third_down_ratio = lag(round(rollapplyr(sum_third_down_converted,rolling_n,sum,partial=TRUE) / rollapplyr(sum_third_down_failed,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  mutate(roll_passing_yards = lag(rollapplyr(sum_passing_yards,rolling_n,sum,partial=TRUE),1)) %>% 
+  mutate(roll_penalty_yards = lag(rollapplyr(sum_penalty_yards,rolling_n,sum,partial=TRUE),1)) %>% 
+  mutate(roll_cpoe_per_pass = lag(round(rollapplyr(sum_cpoe,rolling_n,sum,partial=TRUE) / rollapplyr(pass_plays,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  mutate(roll_pass_oe_per_pass = lag(round(rollapplyr(sum_pass_oe,rolling_n,sum,partial=TRUE) / rollapplyr(pass_plays,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  mutate(roll_WPA_per_play = lag(round((100 * rollapplyr(Off_WPA,rolling_n,sum,partial=TRUE)) / rollapplyr(plays,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  select(posteam, 
+         game_id,
+         row_num,
+         epa_prediction, 
+         epa_prediction_short, 
+         third_down_ratio,
+         roll_passing_yards,
+         roll_penalty_yards,
+         roll_cpoe_per_pass,
+         roll_pass_oe_per_pass,
+         roll_WPA_per_play)
+  
+
+```
+
+```{r}
+
+# Summarize defensive EPA by team
+Def_EPA <- pbp %>%
+  filter((play_type == 'pass' | play_type == 'run') & !is.na(epa)) %>%
+  group_by(defteam, game_id) %>%
+  summarize(Def_EPA = round(sum(epa),2),
+            Def_WPA = round(sum(wpa),2),
+            sum_third_down_converted = sum(third_down_converted, na.rm= TRUE),
+            sum_third_down_failed = sum(third_down_failed, na.rm= TRUE),
+            sum_passing_yards = sum(passing_yards, na.rm= TRUE),
+            sum_penalty_yards = sum(penalty_yards, na.rm= TRUE),
+            sum_pass_oe = sum(pass_oe, na.rm= TRUE),
+            sum_cpoe = sum(cpoe, na.rm= TRUE),
+            pass_plays = sum(pass, na.rm = TRUE),
+            plays = n_distinct(play_id)) %>%
+  mutate(row_num = row_number()) %>% 
+  mutate(epa_prediction = lag(round(rollapplyr(Def_EPA,rolling_n,sum,partial=TRUE) / rollapplyr(plays,rolling_n,sum,partial=TRUE),2), 1)) %>% 
+  mutate(epa_prediction_short = lag(round(rollapplyr(Def_EPA,rolling_n_short,sum,partial=TRUE) / rollapplyr(plays,rolling_n_short,sum,partial=TRUE),2), 1)) %>% 
+  mutate(third_down_ratio = lag(round(rollapplyr(sum_third_down_converted,rolling_n,sum,partial=TRUE) / rollapplyr(sum_third_down_failed,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  mutate(roll_passing_yards = lag(rollapplyr(sum_passing_yards,rolling_n,sum,partial=TRUE),1)) %>% 
+  mutate(roll_penalty_yards = lag(rollapplyr(sum_penalty_yards,rolling_n,sum,partial=TRUE),1)) %>% 
+  mutate(roll_cpoe_per_pass = lag(round(rollapplyr(sum_cpoe,rolling_n,sum,partial=TRUE) / rollapplyr(pass_plays,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  mutate(roll_pass_oe_per_pass = lag(round(rollapplyr(sum_pass_oe,rolling_n,sum,partial=TRUE) / rollapplyr(pass_plays,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  mutate(roll_WPA_per_play = lag(round((100 * rollapplyr(Def_WPA,rolling_n,sum,partial=TRUE)) / rollapplyr(plays,rolling_n,sum,partial=TRUE),2),1)) %>% 
+  select(defteam, 
+         game_id,
+         row_num,
+         epa_prediction_def = epa_prediction, 
+         epa_prediction_short_def = epa_prediction_short, 
+         third_down_ratio_def = third_down_ratio,
+         roll_passing_yards_def = roll_passing_yards,
+         roll_penalty_yards_def = roll_penalty_yards,
+         roll_cpoe_per_pass_def = roll_cpoe_per_pass,
+         roll_pass_oe_per_pass_def = roll_pass_oe_per_pass,
+         roll_WPA_per_play_def = roll_WPA_per_play)
+```
+
+
+
+```{r}
+# Join offensive EPA to list of games
+EPA_regression_data_off <- left_join(left_join(games, Off_EPA, c('game_id' = 'game_id', 'home_team' = 'posteam')), Off_EPA, c('game_id' = 'game_id', 'away_team' = 'posteam')) %>% 
+  filter(row_num.x > rolling_n & 
+           row_num.y > rolling_n & 
+           !is.na(epa_prediction.x) & 
+           !is.na(epa_prediction.y)) %>% 
+  dplyr::select(game_id, 
+                home_team, 
+                away_team, 
+                away_score, 
+                home_score, 
+                result, 
+                spread_line, 
+                environment,
+                home_margin_to_spread,
+              home_off_epa = epa_prediction.x, 
+              home_off_epa_short = epa_prediction_short.x, 
+              home_off_third_down_ratio = third_down_ratio.x,
+              home_off_passing_yards = roll_passing_yards.x,
+              home_off_penalty_yards = roll_penalty_yards.x,
+              home_off_cpoe_per_pass = roll_cpoe_per_pass.x,
+              home_off_pass_oe_per_pass = roll_pass_oe_per_pass.x,
+              home_off_WPA_per_play = roll_WPA_per_play.x,
+                away_off_epa = epa_prediction.y, 
+                away_off_epa_short = epa_prediction_short.y, 
+                away_off_third_down_ratio = third_down_ratio.y,
+                away_off_passing_yards = roll_passing_yards.y,
+                away_off_penalty_yards = roll_penalty_yards.y,
+                away_off_cpoe_per_pass = roll_cpoe_per_pass.y,
+                away_off_pass_oe_per_pass = roll_pass_oe_per_pass.y,
+                away_off_WPA_per_play = roll_WPA_per_play.y)
+```
+
+```{r}
+# Join defensive EPA to list of games
+EPA_regression_data_def <- left_join(left_join(games, Def_EPA, c('game_id' = 'game_id', 'home_team' = 'defteam')), Def_EPA, c('game_id' = 'game_id', 'away_team' = 'defteam')) %>% 
+  filter(row_num.x > rolling_n & 
+           row_num.y > rolling_n & 
+           !is.na(epa_prediction_def.x) & 
+           !is.na(epa_prediction_def.y)) %>% 
+  dplyr::select(game_id, 
+                home_team, 
+                away_team, 
+                away_score, 
+                home_score, 
+                result, 
+                spread_line, 
+                environment,
+                home_margin_to_spread,
+              home_def_epa = epa_prediction_def.x, 
+              home_def_epa_short = epa_prediction_short_def.x, 
+              home_def_third_down_ratio = third_down_ratio_def.x,
+              home_def_passing_yards = roll_passing_yards_def.x,
+              home_def_penalty_yards = roll_penalty_yards_def.x,
+              home_def_cpoe_per_pass = roll_cpoe_per_pass_def.x,
+              home_def_pass_oe_per_pass = roll_pass_oe_per_pass_def.x,
+              home_def_WPA_per_play = roll_WPA_per_play_def.x,
+                away_def_epa = epa_prediction_def.y, 
+                away_def_epa_short = epa_prediction_short_def.y, 
+                away_def_third_down_ratio = third_down_ratio_def.y,
+                away_def_passing_yards = roll_passing_yards_def.y,
+                away_def_penalty_yards = roll_penalty_yards_def.y,
+                away_def_cpoe_per_pass = roll_cpoe_per_pass_def.y,
+                away_def_pass_oe_per_pass = roll_pass_oe_per_pass_def.y,
+                away_def_WPA_per_play = roll_WPA_per_play_def.y)
+```
+
+```{r}
+# Join offensive EPA to defensive EPA
+EPA_regression_data <- left_join(EPA_regression_data_off, EPA_regression_data_def, c('game_id' = 'game_id')) %>% 
+  rename_with(~ tolower(gsub(".x", "", .x, fixed = TRUE))) %>% 
+  mutate(home_cover = if_else(home_margin_to_spread > 0, 1, 0)) %>% 
+  dplyr::select(game_id, 
+                home_team, 
+                away_team, 
+                home_score, 
+                away_score, 
+                result, 
+                spread_line, 
+                home_margin_to_spread,
+                home_cover,
+              home_off_epa, 
+              home_off_epa_short, 
+              home_off_third_down_ratio,
+              home_off_passing_yards,
+              home_off_penalty_yards,
+              home_off_cpoe_per_pass,
+              home_off_pass_oe_per_pass,
+              home_off_wpa_per_play,
+                away_off_epa, 
+                away_off_epa_short, 
+                away_off_third_down_ratio,
+                away_off_passing_yards,
+                away_off_penalty_yards,
+                away_off_cpoe_per_pass,
+                away_off_pass_oe_per_pass,
+                away_off_wpa_per_play,
+              home_def_epa, 
+              home_def_epa_short, 
+              home_def_third_down_ratio,
+              home_def_passing_yards,
+              home_def_penalty_yards,
+              home_def_cpoe_per_pass,
+              home_def_pass_oe_per_pass,
+              home_def_wpa_per_play,
+                away_def_epa, 
+                away_def_epa_short, 
+                away_def_third_down_ratio,
+                away_def_passing_yards,
+                away_def_penalty_yards,
+                away_def_cpoe_per_pass,
+                away_def_pass_oe_per_pass,
+                away_def_wpa_per_play
+              ) 
+```
